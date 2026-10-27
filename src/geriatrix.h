@@ -10,6 +10,7 @@
 #include <iostream>
 #include <stdlib.h>
 #include <string>
+#include <list>
 #include <boost/container/vector.hpp>
 #include <boost/unordered_map.hpp>
 #include <boost/container/flat_map.hpp>

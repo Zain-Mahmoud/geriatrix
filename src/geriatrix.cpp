@@ -645,7 +645,7 @@ size_t createFile(int size_arr_position, struct age *a_grp, struct size *s_grp,
   char name[PATH_MAX];
   std::string sibling_dir = "";
   if((d.depth > 0) && (d.sibling_dirs > 0)) {
-    boost::random::mt19937 gen{static_cast<std::uint64_t>(rand())};
+    boost::random::mt19937 gen(static_cast<std::uint32_t>(rand()));
     boost::random::uniform_int_distribution<std::uint64_t> dist{1,
       static_cast<std::uint64_t>(d.sibling_dirs)};
     auto rand_subdir = dist(gen);
@@ -873,7 +873,7 @@ int performOp(bool create, int size_arr_position,
 
 int performRapidAging(size_t till_size, int idle_injections,
     struct age *a, struct size *s, struct dir *d) {
-  boost::random::mt19937 gen{static_cast<std::uint64_t>(total_size_weight)};
+  boost::random::mt19937 gen(static_cast<std::uint32_t>(total_size_weight));
   boost::random::uniform_int_distribution<std::uint64_t> dist{1,
     static_cast<std::uint64_t>(total_size_weight)};
   while(live_data_size < till_size) {
