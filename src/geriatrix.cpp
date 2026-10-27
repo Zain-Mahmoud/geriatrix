@@ -134,6 +134,12 @@ void issueCreate(const char *path, size_t len) {
       abort();
     }
   }
+
+  rv = g_backend->bd_write(fd, "h", 1);
+  if (rv < 0){
+    perror("file write");
+  }
+
   rv = g_backend->bd_close(fd);
   assert(rv == 0);
   return;
@@ -1015,16 +1021,11 @@ int resumeAgingQuery(uint64_t total_disk_capacity, double runtime) {
   return 0;
 }
 
-void handler(int signo){
-  dumpAgeBuckets(a.out_file);
-  dumpSizeBuckets(s.out_file);
-  dumpDirBuckets(d.out_file);
-  dumpStats(&a, &s, &d);
-  destroy();
-  exit(0);
-}
+
 
 int main(int argc, char *argv[]) {
+
+
   if(argc != 37) {
     usage();
     exit(1);
@@ -1084,18 +1085,11 @@ int main(int argc, char *argv[]) {
   performRapidAging(total_disk_capacity * utilization, idle_injections,
       &a, &s, &d);
   K = tick;
-  struct sigaction sigIntHandler;
-
-  sigIntHandler.sa_handler = handler;
-  sigemptyset(&sigIntHandler.sa_mask);
-  sigIntHandler.sa_flags = 0;
-  sigaction(SIGINT, &sigIntHandler, NULL);
-
   do {
     performStableAging(total_disk_capacity * runs, idle_injections,
         &a, &s, &d, runs);
   } while(query_before_quitting && resumeAgingQuery(total_disk_capacity,
         runtime));
-  handler(0);
+
   return 0;
 }
