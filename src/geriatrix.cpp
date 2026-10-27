@@ -8,6 +8,10 @@
  */
 
 #include "geriatrix.h"
+#include <algorithm>
+#include <cstring>
+#include <memory>
+#include <vector>
 
 #ifdef NEED_POSIX_FALLOCATE
 /*
@@ -215,6 +219,158 @@ int File::deleteFile() {
   if(!fake)
     pool->enqueue([full_path] { issueDelete(full_path.c_str()); });
   return 0;
+}
+
+/*
+ * Workload files: an externally specified set of files (e.g. a filebench
+ * fileset) that geriatrix creates during rapid aging and periodically
+ * rewrites during stable aging, so they end up fragmented like the rest of
+ * the aged file system. They are kept out of the age/size/dir buckets so the
+ * aging profile's distributions are unaffected, but they count towards
+ * live_data_size.
+ */
+struct WorkloadFile {
+  std::string path; // relative to mount_point
+  size_t size;
+};
+
+char *workload_manifest = NULL;
+int workload_churn_every = 0;
+std::vector<WorkloadFile> workload_files;
+std::unique_ptr<std::atomic<bool>[]> workload_busy;
+size_t workload_total_bytes = 0;
+size_t workload_created = 0;
+size_t workload_created_bytes = 0;
+uint64_t workload_churns = 0;
+uint64_t workload_churn_skips = 0;
+
+/*
+ * Write real data (not fallocate): reads of unwritten extents on ext4 never
+ * touch the disk, which would make read benchmarks on these files meaningless.
+ * fsync forces block allocation now, interleaved with the surrounding aging
+ * ops, instead of at delayed-allocation writeback time.
+ */
+void issueCreateData(const char *path, size_t len) {
+  static const size_t chunk = 65536;
+  static char buf[chunk];
+  static std::once_flag buf_init;
+  std::call_once(buf_init, [] { memset(buf, 0xa5, chunk); });
+
+  int fd = g_backend->bd_open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644);
+  if(fd < 0) {
+    fprintf(stderr, "issueCreateData: open(%s): %s\n", path, strerror(errno));
+    abort();
+  }
+  size_t done = 0;
+  while(done < len) {
+    size_t n = std::min(chunk, len - done);
+    ssize_t rv = g_backend->bd_write(fd, buf, n);
+    if(rv < 0) {
+      fprintf(stderr, "issueCreateData: write(%s): %s\n", path,
+          strerror(errno));
+      abort();
+    }
+    done += rv;
+  }
+  fsync(fd);
+  int rv = g_backend->bd_close(fd);
+  assert(rv == 0);
+}
+
+void loadWorkloadManifest(const char *manifest) {
+  std::ifstream infile(manifest);
+  if(!infile) {
+    fprintf(stderr, "cannot open workload manifest %s\n", manifest);
+    exit(1);
+  }
+  std::string type, path;
+  while(infile >> type >> path) {
+    std::string full_path = mount_point + "/" + path;
+    if(type == "D") {
+      if(!fake && mkdir_path(full_path.c_str(), 0755) != 0) {
+        fprintf(stderr, "mkdir(%s): %s\n", full_path.c_str(), strerror(errno));
+        exit(1);
+      }
+    } else if(type == "F") {
+      WorkloadFile wf;
+      wf.path = path;
+      infile >> wf.size;
+      workload_total_bytes += wf.size;
+      workload_files.push_back(wf);
+    } else {
+      fprintf(stderr, "bad workload manifest entry type '%s'\n", type.c_str());
+      exit(1);
+    }
+  }
+  workload_busy.reset(new std::atomic<bool>[workload_files.size()]);
+  for(size_t i = 0; i < workload_files.size(); i++) {
+    workload_busy[i] = false;
+  }
+  std::cout << "Workload manifest: " << workload_files.size() << " files, "
+    << workload_total_bytes / 1048576 << " MB" << std::endl;
+}
+
+void enqueueWorkloadWrite(size_t i, bool unlink_first) {
+  if(fake) {
+    return;
+  }
+  workload_busy[i] = true;
+  std::string full_path = mount_point + "/" + workload_files[i].path;
+  size_t size = workload_files[i].size;
+  // unlink + rewrite is a single task so concurrent workers cannot reorder them
+  pool->enqueue([full_path, size, unlink_first, i] {
+    if(unlink_first) {
+      issueDelete(full_path.c_str());
+    }
+    issueCreateData(full_path.c_str(), size);
+    workload_busy[i] = false;
+  });
+}
+
+// Create workload files until their share of created bytes keeps pace with
+// the overall fill, so they are spread across the whole rapid aging phase.
+void createWorkloadFilesUpTo(double fill_fraction) {
+  while(workload_created < workload_files.size() &&
+      (double)workload_created_bytes <
+      fill_fraction * workload_total_bytes) {
+    enqueueWorkloadWrite(workload_created, false);
+    workload_created_bytes += workload_files[workload_created].size;
+    live_data_size += workload_files[workload_created].size;
+    workload_created++;
+  }
+}
+
+// Rewrite a random workload file in place, relocating it into the current
+// (fragmented) free space.
+void churnWorkloadFile() {
+  size_t i = rand() % workload_files.size();
+  if(workload_busy[i]) {
+    workload_churn_skips++;
+    return;
+  }
+  enqueueWorkloadWrite(i, true);
+  workload_size += workload_files[i].size;
+  workload_churns++;
+}
+
+int verifyWorkloadFiles() {
+  int bad = 0;
+  for(auto &wf : workload_files) {
+    struct stat st;
+    std::string full_path = mount_point + "/" + wf.path;
+    if(g_backend->bd_stat(full_path.c_str(), &st) != 0) {
+      fprintf(stderr, "workload file missing: %s\n", full_path.c_str());
+      bad++;
+    } else if((size_t)st.st_size != wf.size) {
+      fprintf(stderr, "workload file %s has size %lld, expected %zu\n",
+          full_path.c_str(), (long long)st.st_size, wf.size);
+      bad++;
+    }
+  }
+  std::cout << "Workload files: " << workload_files.size() << " created, "
+    << workload_churns << " rewrites (" << workload_churn_skips
+    << " skipped while busy), " << bad << " failed verification" << std::endl;
+  return bad;
 }
 
 struct BucketCompare {
@@ -883,6 +1039,9 @@ int performRapidAging(size_t till_size, int idle_injections,
   boost::random::uniform_int_distribution<std::uint64_t> dist{1,
     static_cast<std::uint64_t>(total_size_weight)};
   while(live_data_size < till_size) {
+    if(!workload_files.empty()) {
+      createWorkloadFilesUpTo((double)live_data_size / till_size);
+    }
     auto rand = dist(gen);
     int j = 0;
     while(rand > s->cutoffs[j]) {
@@ -893,6 +1052,9 @@ int performRapidAging(size_t till_size, int idle_injections,
       }
     }
     performOp(true, j, idle_injections, a, s, d);
+  }
+  if(!workload_files.empty()) {
+    createWorkloadFilesUpTo(1.0);
   }
   return 0;
 }
@@ -908,6 +1070,10 @@ int performStableAging(size_t till_size, int idle_injections,
       performOp(true, -1, idle_injections, a, s, d); // create file
     } else {
       performOp(false, -1, idle_injections, a, s, d); // delete file
+    }
+    if(workload_churn_every > 0 && !workload_files.empty() &&
+        (tick % workload_churn_every) == 0) {
+      churnWorkloadFile();
     }
     reAge(a, future_tick);
 
@@ -970,6 +1136,9 @@ void usage() {
   std::cout << "        -q <0 / 1 ask before quitting>" << std::endl;
   std::cout << "        -w <num mins>" << std::endl;
   std::cout << "        -b <backend (posix, deltafs, etc.)>" << std::endl;
+  std::cout << "        [-W <workload manifest>]" << std::endl;
+  std::cout << "        [-k <rewrite one workload file every k ops>]"
+    << std::endl;
   std::cout << std::endl;
 }
 
@@ -1026,10 +1195,6 @@ int resumeAgingQuery(uint64_t total_disk_capacity, double runtime) {
 int main(int argc, char *argv[]) {
 
 
-  if(argc != 37) {
-    usage();
-    exit(1);
-  }
   char *mybackend = NULL;
   //uint64_t total_disk_capacity = 0;
   double utilization = 0.0;
@@ -1039,7 +1204,7 @@ int main(int argc, char *argv[]) {
   int idle_injections = 0;
   int query_before_quitting = 0;
   while((option = getopt(argc, argv,
-                         "n:u:r:m:a:s:d:x:y:z:t:i:f:p:c:q:w:b:")) != EOF) {
+                         "n:u:r:m:a:s:d:x:y:z:t:i:f:p:c:q:w:b:W:k:")) != EOF) {
     switch(option) {
       case 'n': total_disk_capacity = strtoull(optarg, NULL, 10); break;
       case 'u': utilization = strtod(optarg, NULL); break;
@@ -1059,7 +1224,21 @@ int main(int argc, char *argv[]) {
       case 'q': query_before_quitting = atoi(optarg); break;
       case 'w': runtime_max = atoi(optarg); break;
       case 'b': mybackend = optarg; break;
+      case 'W': workload_manifest = optarg; break;
+      case 'k': workload_churn_every = atoi(optarg); break;
+      default: usage(); exit(1);
     }
+  }
+  if(total_disk_capacity == 0 || utilization <= 0 || mount_point.empty() ||
+      !a.in_file || !s.in_file || !d.in_file ||
+      !a.out_file || !s.out_file || !d.out_file ||
+      (concurrency < 1 && !fake)) {
+    usage();
+    exit(1);
+  }
+  if(workload_churn_every > 0 && !workload_manifest) {
+    fprintf(stderr, "-k requires -W\n");
+    exit(1);
   }
   if (!mybackend || strcmp(mybackend, "posix") == 0) {
       /* do nothing, posix is the default */
@@ -1081,6 +1260,16 @@ int main(int argc, char *argv[]) {
     dist = new boost::math::chi_squared(NUM_AGES - 1);
     goodness_measure = cdf(*dist, confidence);
   }
+  if(workload_manifest) {
+    loadWorkloadManifest(workload_manifest);
+    // leave at least 5% of the target fill for geriatrix's own files
+    if(workload_total_bytes > 0.95 * total_disk_capacity * utilization) {
+      fprintf(stderr, "workload (%zu bytes) does not fit in %.0f bytes of "
+          "target utilization\n", workload_total_bytes,
+          total_disk_capacity * utilization);
+      exit(1);
+    }
+  }
   pool = new ThreadPool(concurrency);
   performRapidAging(total_disk_capacity * utilization, idle_injections,
       &a, &s, &d);
@@ -1091,5 +1280,11 @@ int main(int argc, char *argv[]) {
   } while(query_before_quitting && resumeAgingQuery(total_disk_capacity,
         runtime));
 
+  // drain queued creates/deletes; ~ThreadPool runs remaining tasks
+  delete pool;
+  pool = NULL;
+  if(!workload_files.empty() && !fake && verifyWorkloadFiles() != 0) {
+    return 1;
+  }
   return 0;
 }
